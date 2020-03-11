@@ -1,12 +1,64 @@
-import threading
 import subprocess
-import os
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Event
+
 from tqdm import tqdm
 
 
+class Task(object):
+    def __init__(self, command):
+        self.task = command
+        self.self_lock = None
+        self.sibling_locks = []
+
+    def __cmp__(self, other):
+        return self.name() == other.name()
+
+    def __hash__(self):
+        return self.task.__hash__()
+
+    def clone(self):
+        new_task = Task(self.task)
+        new_task.self_lock = self.self_lock
+        new_task.sibling_locks = self.sibling_locks
+        return new_task
+
+    def replace(self, old, new):
+        self.task = self.task.replace(old, new)
+
+    def run(self, t=False):
+        for lock in self.sibling_locks:
+            lock.wait()
+        self._run_task(t)
+        if self.self_lock:
+            self.self_lock.set()
+
+    def wait_for(self, siblings):
+        for sibling in siblings:
+            self.sibling_locks.append(sibling.get_lock())
+
+    def name(self):
+        return self.task
+
+    def get_lock(self):
+        if not self.self_lock:
+            self.self_lock = Event()
+            self.self_lock.clear()
+        return self.self_lock
+
+    def _run_task(self, t=False):
+        if t:
+            s = subprocess.Popen(self.task, shell=True, stdout=subprocess.PIPE)
+            out = s.stdout.readline().decode("utf-8")
+            if out != "":
+                t.write(out)
+        else:
+            subprocess.Popen(self.task, shell=True)
+
+
 class Worker(object):
-    def __init__(self, queue, timeout, output, tqdm):
-        self.queue = queue
+    def __init__(self, task_queue, timeout, output, tqdm):
+        self.queue = task_queue
         self.timeout = timeout
         self.output = output
         self.tqdm = tqdm
@@ -19,24 +71,16 @@ class Worker(object):
                 if isinstance(self.tqdm, tqdm):
                     self.tqdm.update(1)
                     # run task
-                    self.run_task(task, self.tqdm)
+                    task.run(self.tqdm)
                 else:
-                    self.run_task(task)
+                    task.run()
             except IndexError:
                 break
 
-    @staticmethod
-    def run_task(task, t=False):
-        if t:
-            s = subprocess.Popen(task, shell=True, stdout=subprocess.PIPE)
-            t.write(s.stdout.readline().decode("utf-8"))
-        else:
-            subprocess.Popen(task, shell=True)
-
 
 class Pool(object):
-    def __init__(self, max_workers, queue, timeout, output, progress_bar):
-        
+    def __init__(self, max_workers, task_queue, timeout, output, progress_bar):
+
         # convert stdin input to integer
         max_workers = int(max_workers)
 
@@ -45,34 +89,27 @@ class Pool(object):
             raise ValueError("Workers must be >= 1")
 
         # check if the queue is empty
-        if not queue:
+        if not task_queue:
             raise ValueError("The queue is empty")
 
-        self.queue = queue
+        self.queue = task_queue
         self.timeout = timeout
         self.output = output
-        self.max_workers = max_workers
+        self.max_workers = min(len(task_queue), max_workers)
 
         if not progress_bar:
-            self.tqdm = tqdm(total=len(queue))
+            self.tqdm = tqdm(total=len(task_queue))
         else:
             self.tqdm = True
 
     def run(self):
-
         workers = [Worker(self.queue, self.timeout, self.output, self.tqdm) for w in range(self.max_workers)]
-        threads = []
-
 
         # run
-        for worker in workers:
-            thread = threading.Thread(target=worker)
-            thread.start()
-            threads.append(thread)
+        with ThreadPoolExecutor(self.max_workers) as executors:
+            for worker in workers:
+                executors.submit(worker)
 
-        # wait until all workers have completed their tasks
-        for thread in threads:
-            thread.join()
 
 # test harness
 if __name__ == "__main__":
